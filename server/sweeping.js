@@ -3,6 +3,42 @@ import { nextOccurrence, buildGcalUrl } from './schedule.js';
 const GEOCODER_URL =
   'https://geocoding.geo.census.gov/geocoder/locations/onelineaddress';
 const SOCRATA_URL = 'https://data.lacity.org/resource/krk7-ayq2.json';
+const SOCRATA_COLUMNS_URL =
+  'https://data.lacity.org/api/views/krk7-ayq2/columns.json';
+
+// Geometry-like Socrata column types. Any one of these is a spatial column
+// we can use with within_circle().
+const GEOMETRY_RENDER_TYPES = new Set([
+  'multiline', 'line', 'multilinestring',
+  'multipolygon', 'polygon',
+  'multipoint', 'point',
+  'location',
+]);
+
+// Discovered once and cached for the life of the server.
+let cachedGeomColumn = null;
+
+async function getGeometryColumn() {
+  if (cachedGeomColumn) return cachedGeomColumn;
+  const res = await fetch(SOCRATA_COLUMNS_URL);
+  if (!res.ok) {
+    throw new Error(`Could not read LA dataset schema: ${res.status}`);
+  }
+  const cols = await res.json();
+  const geom = cols.find((c) =>
+    GEOMETRY_RENDER_TYPES.has(
+      String(c.renderTypeName || c.dataTypeName || '').toLowerCase()
+    )
+  );
+  if (!geom) {
+    throw new Error(
+      'No geometry column found in LA dataset (schema may have changed).'
+    );
+  }
+  cachedGeomColumn = geom.fieldName;
+  console.log(`[sweeping] discovered geometry column: ${cachedGeomColumn}`);
+  return cachedGeomColumn;
+}
 
 /**
  * Map of common day-abbreviation variants used in the LA dataset to a
@@ -94,17 +130,27 @@ async function geocode(address) {
  * We expand the search radius progressively until we hit something or give up.
  */
 async function findNearbyRoutes(lat, lng) {
+  const geomCol = await getGeometryColumn();
   const radii = [25, 50, 100, 200];
+  let loggedKeys = false;
   for (const radius of radii) {
-    const where = `within_circle(the_geom, ${lat}, ${lng}, ${radius})`;
+    const where = `within_circle(${geomCol}, ${lat}, ${lng}, ${radius})`;
     const url = `${SOCRATA_URL}?$where=${encodeURIComponent(where)}&$limit=25`;
     const res = await fetch(url);
     if (!res.ok) {
       const body = await res.text().catch(() => '');
-      throw new Error(`LA data portal returned ${res.status}: ${body.slice(0, 200)}`);
+      throw new Error(
+        `LA data portal returned ${res.status}: ${body.slice(0, 300)}`
+      );
     }
     const rows = await res.json();
-    if (Array.isArray(rows) && rows.length > 0) return rows;
+    if (Array.isArray(rows) && rows.length > 0) {
+      if (!loggedKeys) {
+        console.log('[sweeping] row keys:', Object.keys(rows[0]));
+        loggedKeys = true;
+      }
+      return rows;
+    }
   }
   return [];
 }
