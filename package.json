@@ -1,0 +1,14 @@
+{
+  "name": "la-sweep",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Look up LA street sweeping schedules by address and add a reminder to Google Calendar.",
+  "scripts": {
+    "install:all": "npm --prefix server install && npm --prefix client install",
+    "dev": "concurrently -k -n server,client -c magenta,cyan \"npm --prefix server run dev\" \"npm --prefix client run dev\"",
+    "start": "npm --prefix server start"
+  },
+  "devDependencies": {
+    "concurrently": "^9.0.1"
+  }
+}
