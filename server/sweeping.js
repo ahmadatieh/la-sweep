@@ -43,7 +43,8 @@ export async function lookupAddress(address) {
       const next = nextOccurrence(
         dayIndex,
         parsed.startTime,
-        parsed.endTime
+        parsed.endTime,
+        parsed.weeks
       );
       const gcalUrl = buildGcalUrl({
         address: location.matchedAddress,

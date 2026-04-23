@@ -125,14 +125,39 @@ function pad(n) {
 }
 
 /**
- * Compute the next occurrence of a weekly sweep in LA time.
+ * Which week-of-the-month is a given day-of-month? ("1st Thursday" = 1, etc.)
+ * LA's dataset tags biweekly routes as "1 & 3" (the 1st & 3rd occurrence of
+ * that weekday in the month) and "2 & 4" (2nd & 4th), which is exactly the
+ * same as Math.ceil(dayOfMonth / 7).
+ */
+function nthWeekdayOfMonth(dayOfMonth) {
+  return Math.ceil(dayOfMonth / 7);
+}
+
+/**
+ * Parse a "weeks" string from the LA dataset into a set of allowed week
+ * ordinals. "1 & 3" → [1, 3]. Garbage / empty → null (treat as "every week").
+ */
+function parseAllowedWeeks(weeks) {
+  if (!weeks) return null;
+  const nums = String(weeks).match(/\d+/g);
+  if (!nums) return null;
+  const valid = nums.map(Number).filter((n) => n >= 1 && n <= 5);
+  return valid.length > 0 ? valid : null;
+}
+
+/**
+ * Compute the next occurrence of a sweep in LA time. Respects the biweekly
+ * "weeks" flag — e.g. a "weeks 1 & 3" Thursday route skips over the 2nd,
+ * 4th, and 5th Thursdays of the month.
  *
  * @param {number} dayIndex 0=Sun..6=Sat (Date#getDay convention)
  * @param {string} startStr e.g. "8:00 AM"
  * @param {string} endStr   e.g. "10:00 AM"
+ * @param {string|null} weeks e.g. "1 & 3" or null for weekly
  * @returns {{ start: string, end: string }} ISO strings in UTC
  */
-export function nextOccurrence(dayIndex, startStr, endStr) {
+export function nextOccurrence(dayIndex, startStr, endStr, weeks = null) {
   const startT = parseTime(startStr) || { hour: 8, minute: 0 };
   const endT =
     parseTime(endStr) || {
@@ -140,10 +165,11 @@ export function nextOccurrence(dayIndex, startStr, endStr) {
       minute: startT.minute,
     };
 
+  const allowedWeeks = parseAllowedWeeks(weeks);
   const now = laParts();
 
-  // Days until the target weekday. If it's the same day, check whether the
-  // sweep window has already ended in LA time — if so, bump to next week.
+  // Start searching from the next instance of this weekday (today if it
+  // hasn't passed).
   let daysAhead = (dayIndex - now.weekday + 7) % 7;
   if (daysAhead === 0) {
     const nowMinutes = now.hour * 60 + now.minute;
@@ -151,9 +177,20 @@ export function nextOccurrence(dayIndex, startStr, endStr) {
     if (nowMinutes >= endMinutes) daysAhead = 7;
   }
 
-  // Compute LA-local Y/M/D for the target date.
   const laBase = new Date(Date.UTC(now.year, now.month - 1, now.day));
   laBase.setUTCDate(laBase.getUTCDate() + daysAhead);
+
+  // If this is a biweekly route, walk forward 7 days at a time until we
+  // land on an allowed week-of-month. Bounded at ~3 months so we can never
+  // loop forever on malformed data.
+  if (allowedWeeks) {
+    for (let guard = 0; guard < 15; guard++) {
+      const n = nthWeekdayOfMonth(laBase.getUTCDate());
+      if (allowedWeeks.includes(n)) break;
+      laBase.setUTCDate(laBase.getUTCDate() + 7);
+    }
+  }
+
   const ty = laBase.getUTCFullYear();
   const tm = laBase.getUTCMonth() + 1;
   const td = laBase.getUTCDate();
