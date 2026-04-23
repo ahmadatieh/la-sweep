@@ -135,15 +135,16 @@ function nthWeekdayOfMonth(dayOfMonth) {
 }
 
 /**
- * Parse a "weeks" string from the LA dataset into a set of allowed week
- * ordinals. "1 & 3" → [1, 3]. Garbage / empty → null (treat as "every week").
+ * Parse a "weeks" string from the LA dataset into a sorted list of allowed
+ * week ordinals. "1 & 3" → [1, 3]. Garbage / empty → [] (treat as weekly).
  */
-function parseAllowedWeeks(weeks) {
-  if (!weeks) return null;
+export function parseAllowedWeeks(weeks) {
+  if (!weeks) return [];
   const nums = String(weeks).match(/\d+/g);
-  if (!nums) return null;
-  const valid = nums.map(Number).filter((n) => n >= 1 && n <= 5);
-  return valid.length > 0 ? valid : null;
+  if (!nums) return [];
+  return [
+    ...new Set(nums.map(Number).filter((n) => n >= 1 && n <= 5)),
+  ].sort((a, b) => a - b);
 }
 
 /**
@@ -183,7 +184,7 @@ export function nextOccurrence(dayIndex, startStr, endStr, weeks = null) {
   // If this is a biweekly route, walk forward 7 days at a time until we
   // land on an allowed week-of-month. Bounded at ~3 months so we can never
   // loop forever on malformed data.
-  if (allowedWeeks) {
+  if (allowedWeeks.length > 0) {
     for (let guard = 0; guard < 15; guard++) {
       const n = nthWeekdayOfMonth(laBase.getUTCDate());
       if (allowedWeeks.includes(n)) break;
@@ -222,28 +223,18 @@ function toGcalStamp(date) {
 const RRULE_DAY = ['SU', 'MO', 'TU', 'WE', 'TH', 'FR', 'SA'];
 
 /**
- * Build an iCal RRULE for the sweep schedule, based on day-of-week and the
- * route's "weeks" flag from the LA dataset.
+ * Build an iCal RRULE for a *weekly* sweep (single BYDAY, no ordinals).
+ * Google Calendar's /render endpoint displays this correctly as
+ * "Weekly on Wednesday".
  *
- *   weekly route       → FREQ=WEEKLY;BYDAY=WE
- *   "weeks 1 & 3" Wed  → FREQ=MONTHLY;BYDAY=1WE,3WE
- *   "weeks 2 & 4" Mon  → FREQ=MONTHLY;BYDAY=2MO,4MO
- *
- * Returns null if we can't produce a sane rule (e.g. unknown day).
+ * Biweekly routes do NOT use this — they go through the .ics endpoint,
+ * where a proper FREQ=MONTHLY;BYDAY=1WE,3WE rule can be expressed
+ * (Google's /render UI silently collapses multi-ordinal rules to a single
+ * ordinal label, so we avoid that code path entirely for biweekly).
  */
-function buildRRule(dayIndex, weeks) {
+function buildWeeklyRRule(dayIndex) {
   const code = RRULE_DAY[dayIndex];
   if (!code) return null;
-
-  if (weeks) {
-    // Pull any digits out — accepts "1 & 3", "2, 4", "1 and 3", etc.
-    const nums = String(weeks).match(/\d+/g) || [];
-    const valid = nums.map(Number).filter((n) => n >= 1 && n <= 5);
-    if (valid.length > 0) {
-      const byDay = valid.map((n) => `${n}${code}`).join(',');
-      return `RRULE:FREQ=MONTHLY;BYDAY=${byDay}`;
-    }
-  }
   return `RRULE:FREQ=WEEKLY;BYDAY=${code}`;
 }
 
@@ -267,9 +258,16 @@ function cadenceDescription(dayIndex, weeks) {
 }
 
 /**
- * Build a Google Calendar "create event" URL. Users click it and confirm;
- * no OAuth required. Includes an RRULE so the event recurs on the actual
- * sweep schedule (weekly or biweekly) rather than being a one-off.
+ * Build the "Add to Calendar" URL for a sweep schedule.
+ *
+ * Weekly routes get a Google Calendar /render URL with an inline RRULE —
+ * one click, no download, shows up in the user's tab.
+ *
+ * Biweekly routes get a URL pointing at our own /api/calendar.ics
+ * endpoint. Clicking it downloads a tiny file which, when opened, imports
+ * into Google Calendar / Apple Calendar / Outlook with a proper
+ * FREQ=MONTHLY;BYDAY=1WE,3WE rule — the one thing Google's /render UI
+ * can't express correctly.
  */
 export function buildGcalUrl({
   address,
@@ -278,8 +276,16 @@ export function buildGcalUrl({
   start,
   end,
   dayIndex,
-  weeks,
+  weeks = null,
+  baseUrl = '',
 }) {
+  const isBiweekly = parseAllowedWeeks(weeks).length > 0;
+  if (isBiweekly) {
+    return buildIcsDownloadUrl({
+      address, routeNo, boundaries, start, end, dayIndex, weeks, baseUrl,
+    });
+  }
+
   const dates = `${toGcalStamp(start)}/${toGcalStamp(end)}`;
   const cadence = dayIndex != null ? cadenceDescription(dayIndex, weeks) : null;
   const detailsLines = [
@@ -300,8 +306,36 @@ export function buildGcalUrl({
     ctz: LA_TZ,
   });
 
-  const rrule = dayIndex != null ? buildRRule(dayIndex, weeks) : null;
-  if (rrule) params.append('recur', rrule);
+  let url = `https://calendar.google.com/calendar/render?${params.toString()}`;
+  // Append recur raw — Google's parser handles unencoded RRULE characters
+  // fine, while percent-encoded versions sometimes confuse its UI parser.
+  const rrule = dayIndex != null ? buildWeeklyRRule(dayIndex) : null;
+  if (rrule) url += `&recur=${rrule.replace(/ /g, '%20')}`;
+  return url;
+}
 
-  return `https://calendar.google.com/calendar/render?${params.toString()}`;
+/**
+ * Build an absolute URL to our /api/calendar.ics endpoint, carrying all
+ * the event state in query params. The endpoint is stateless — no DB
+ * lookup, no session — so the URL is self-contained.
+ *
+ * baseUrl is derived from the incoming /api/lookup request so the link
+ * points back at whichever host the backend is running on (Render prod,
+ * local dev, preview deploys). If baseUrl is empty we fall back to a
+ * relative URL which works in local dev via the Vite proxy.
+ */
+function buildIcsDownloadUrl({
+  address, routeNo, boundaries, start, end, dayIndex, weeks, baseUrl,
+}) {
+  const params = new URLSearchParams({
+    address: address || '',
+    routeNo: routeNo || '',
+    boundaries: boundaries || '',
+    start: typeof start === 'string' ? start : new Date(start).toISOString(),
+    end: typeof end === 'string' ? end : new Date(end).toISOString(),
+    dayIndex: String(dayIndex ?? ''),
+    weeks: weeks || '',
+  });
+  const prefix = (baseUrl || '').replace(/\/+$/, '');
+  return `${prefix}/api/calendar.ics?${params.toString()}`;
 }

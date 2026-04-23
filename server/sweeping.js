@@ -28,7 +28,7 @@ const DAY_TO_INDEX = {
   SATURDAY: 6, SAT: 6, SA: 6,
 };
 
-export async function lookupAddress(address) {
+export async function lookupAddress(address, { baseUrl = '' } = {}) {
   const location = await geocode(address);
   const features = await findRoutesAtPoint(location.lat, location.lng);
 
@@ -54,6 +54,7 @@ export async function lookupAddress(address) {
         end: next.end,
         dayIndex,
         weeks: parsed.weeks,
+        baseUrl,
       });
       schedules.push({
         routeNo: parsed.routeNo,
