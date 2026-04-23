@@ -217,11 +217,22 @@ async function findRoutesByStreetName(streetName) {
   return rows;
 }
 
+// Recognized day suffixes appearing at the end of route_no strings, ordered
+// longest-first so the regex prefers multi-char matches (e.g. "Tu" over "T").
+const ROUTE_DAY_SUFFIX_RE = new RegExp(
+  String.raw`^(.*?)\s+(SUN|MON|TUES|TUE|THURS|THUR|THU|WED|FRI|SAT|SU|TU|TH|WE|FR|SA|M|W|F)\.?$`,
+  'i'
+);
+
 /**
  * Normalize a Socrata row into a stable shape. Field names on LA datasets have
  * shifted over the years, so we check a handful of likely column names for
- * each logical field. Day-of-week may be absent entirely; that's handled in
- * the caller.
+ * each logical field.
+ *
+ * Day-of-week: LA's current `krk7-ayq2` schema doesn't expose a weekday
+ * column, but encodes the day as a whitespace-separated suffix on the route
+ * number itself (e.g. "8P205 M", "13P282 Th", "7P326 W"). We strip the
+ * suffix off the route number and lift it into `dayAbbr`.
  */
 function parseRow(row) {
   const pick = (...names) => {
@@ -230,11 +241,25 @@ function parseRow(row) {
     }
     return '';
   };
+
+  let routeNo = String(pick('route_no', 'route', 'route_number', 'routeno'))
+    .replace(/^\*\s*/, '') // some rows prefix with "* " for special routes
+    .trim();
+
+  let dayAbbr = String(pick('weekday', 'day_of_week', 'day', 'dow')).trim();
+
+  // If no explicit day column, try the suffix on route_no.
+  if (!dayAbbr) {
+    const m = routeNo.match(ROUTE_DAY_SUFFIX_RE);
+    if (m) {
+      routeNo = m[1].trim();
+      dayAbbr = m[2];
+    }
+  }
+
   return {
-    routeNo: String(pick('route_no', 'route', 'route_number', 'routeno'))
-      .replace(/^\*\s*/, '') // some rows prefix with "* " for special routes
-      .trim(),
-    dayAbbr: String(pick('weekday', 'day_of_week', 'day', 'dow')).trim(),
+    routeNo,
+    dayAbbr,
     startTime: String(pick('time_start', 'start_time', 'starttime', 'start')).trim(),
     endTime: String(pick('time_end', 'end_time', 'endtime', 'end')).trim(),
     boundaries: String(pick('boundaries', 'description', 'location_description')).trim(),
