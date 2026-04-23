@@ -63,9 +63,10 @@ export async function lookupAddress(address) {
         weeks: parsed.weeks,
         oddEven: parsed.oddEven,
         maintDistrict: parsed.maintDistrict,
-        // Preserve the old response field name so the existing Framer
-        // component's "CD" pill keeps rendering without changes.
-        councilDistrict: parsed.maintDistrict || '',
+        // Real Council District if the layer exposes one, otherwise empty.
+        // (maintDistrict is a Bureau of Street Services maintenance code like
+        // "112" — not a council district, so we no longer alias it here.)
+        councilDistrict: parsed.councilDistrict || '',
         nextSweep: next,
         gcalUrl,
       });
@@ -146,9 +147,18 @@ async function findRoutesAtPoint(lat, lng) {
     console.log(
       `[sweeping] ${features.length} route polygon(s) at (${lat.toFixed(4)}, ${lng.toFixed(4)})`
     );
+    // One-time log of attribute keys so we can see which fields the ArcGIS
+    // layer actually exposes (handy for spotting Council District / CD).
+    if (!loggedAttributeKeysOnce) {
+      loggedAttributeKeysOnce = true;
+      const keys = Object.keys(features[0]?.attributes || {});
+      console.log(`[sweeping] feature attribute keys: ${keys.join(', ')}`);
+    }
   }
   return features;
 }
+
+let loggedAttributeKeysOnce = false;
 
 /**
  * Take a raw ArcGIS feature and pull out the fields we need. Returns null if
@@ -170,12 +180,27 @@ function parseFeature(feature) {
   const dayIndexes = resolveDayIndexes(a.Day_Short, a.Posted_Day);
   if (dayIndexes.length === 0) return null;
 
+  // ArcGIS stores "Route" as "12P125 M" (route number + day suffix). Strip
+  // the day suffix so routeNo is clean — the day is already in dayAbbr.
+  const routeNoRaw = String(a.Route || '').trim();
+  const routeNo = routeNoRaw
+    .replace(/\s+(SUN|MON|TUES|TUE|THURS|THUR|THU|WED|FRI|SAT|SU|TU|TH|WE|FR|SA|M|W|F)\.?\s*$/i, '')
+    .trim();
+
+  // Probe likely council-district field names. The layer's attribute keys
+  // are logged on first request so we can see what's available. If nothing
+  // matches we leave it empty rather than guessing.
+  const councilDistrict = String(
+    a.Council_District ?? a.CouncilDistrict ?? a.CD ?? a.Cd ?? a.CD_NUMBER ?? ''
+  ).trim();
+
   return {
-    routeNo: String(a.Route || '').trim(),
+    routeNo,
     boundaries: String(a.Boundaries || '').trim(),
     weeks: String(a.Weeks || '').trim() || null,
     oddEven: String(a.Odd_Even || '').trim() || null,
     maintDistrict: String(a.Maint_District || '').trim() || null,
+    councilDistrict: councilDistrict || null,
     startTime: startRaw,
     endTime: endRaw,
     dayIndexes,

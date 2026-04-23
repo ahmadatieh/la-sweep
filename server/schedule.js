@@ -10,22 +10,36 @@
 const LA_TZ = 'America/Los_Angeles';
 
 /**
- * Parse a time string like "8:00 AM", "10:00 PM", or "08:00:00" into
- * { hour, minute } in 24-hour format. Returns null if unrecognized.
+ * Parse a time string into { hour, minute } in 24-hour format. Handles the
+ * formats the LA datasets throw at us:
+ *   "8:00 AM", "10:00PM"         (with minutes + meridiem)
+ *   "1 pm", "10 AM", "12 am"     (no minutes, lowercase fine, space optional)
+ *   "08:00", "08:00:00"          (24-hour)
+ * Returns null if unrecognized.
  */
 export function parseTime(input) {
   if (!input) return null;
-  const s = String(input).trim();
+  const s = String(input).trim().toUpperCase();
 
-  // "8:00 AM" / "10:00 PM"
-  const m12 = s.toUpperCase().match(/^(\d{1,2}):(\d{2})\s*(AM|PM)$/);
-  if (m12) {
-    let hour = Number(m12[1]);
-    const minute = Number(m12[2]);
-    const mer = m12[3];
+  // "8:00 AM" / "10:00PM" — with minutes + meridiem
+  const mMin = s.match(/^(\d{1,2}):(\d{2})\s*(AM|PM)$/);
+  if (mMin) {
+    let hour = Number(mMin[1]);
+    const minute = Number(mMin[2]);
+    const mer = mMin[3];
     if (mer === 'PM' && hour < 12) hour += 12;
     if (mer === 'AM' && hour === 12) hour = 0;
     return { hour, minute };
+  }
+
+  // "1 PM" / "10AM" — no minutes, meridiem only
+  const mHourOnly = s.match(/^(\d{1,2})\s*(AM|PM)$/);
+  if (mHourOnly) {
+    let hour = Number(mHourOnly[1]);
+    const mer = mHourOnly[2];
+    if (mer === 'PM' && hour < 12) hour += 12;
+    if (mer === 'AM' && hour === 12) hour = 0;
+    return { hour, minute: 0 };
   }
 
   // "08:00" or "08:00:00" (24-hour)
