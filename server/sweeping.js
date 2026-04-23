@@ -4,57 +4,17 @@ const GEOCODER_URL =
   'https://geocoding.geo.census.gov/geocoder/locations/onelineaddress';
 const SOCRATA_URL = 'https://data.lacity.org/resource/krk7-ayq2.json';
 
-// GeoJSON geometry types we care about.
-const GEOJSON_TYPES = new Set([
-  'Point', 'MultiPoint',
-  'LineString', 'MultiLineString',
-  'Polygon', 'MultiPolygon',
-]);
-
-// Discovered once and cached for the life of the server.
-let cachedGeomColumn = null;
-
 /**
- * Discover the geometry column by fetching a sample row and finding the key
- * whose value looks like a GeoJSON geometry. This is more robust than
- * reading Socrata's column metadata, which sometimes labels custom geometry
- * columns in inconsistent ways.
+ * The LA open-data Socrata dataset `krk7-ayq2` ("Posted Street Sweeping
+ * Routes") no longer carries a geometry column. We used to do a spatial
+ * `within_circle()` query; that endpoint now 400s with "No such column: the_geom".
+ *
+ * Fallback strategy: geocode the address, extract the street name, and ask
+ * Socrata for rows whose `boundaries` description mentions that street. This
+ * returns the routes whose polygon boundary *touches* the user's street.
+ * Imperfect (a user on a side-street inside a polygon won't match) but it's
+ * the best we can do without geometry. The UI disclaims this.
  */
-async function getGeometryColumn() {
-  if (cachedGeomColumn) return cachedGeomColumn;
-  const res = await fetch(`${SOCRATA_URL}?$limit=1`);
-  if (!res.ok) {
-    const body = await res.text().catch(() => '');
-    throw new Error(
-      `Sample fetch failed: ${res.status} ${body.slice(0, 200)}`
-    );
-  }
-  const rows = await res.json();
-  if (!Array.isArray(rows) || rows.length === 0) {
-    throw new Error('LA dataset returned no sample rows.');
-  }
-  const row = rows[0];
-  const keys = Object.keys(row);
-  console.log('[sweeping] sample row keys:', keys);
-
-  const geomKey = keys.find((k) => {
-    const v = row[k];
-    if (!v || typeof v !== 'object' || Array.isArray(v)) return false;
-    if (typeof v.type === 'string' && GEOJSON_TYPES.has(v.type)) return true;
-    if (Array.isArray(v.coordinates)) return true;
-    return false;
-  });
-
-  if (!geomKey) {
-    throw new Error(
-      `Could not find geometry column. Columns available: ${keys.join(', ')}. ` +
-        `Sample row: ${JSON.stringify(row).slice(0, 500)}`
-    );
-  }
-  cachedGeomColumn = geomKey;
-  console.log(`[sweeping] using geometry column: ${cachedGeomColumn}`);
-  return cachedGeomColumn;
-}
 
 /**
  * Map of common day-abbreviation variants used in the LA dataset to a
@@ -71,19 +31,63 @@ const DAY_ABBR_TO_INDEX = {
   SAT: 6, SA: 6,
 };
 
+// Common street-type suffixes we'll strip when reducing an address to its
+// "core" street name. Kept broad so we match what the Census geocoder returns.
+const STREET_SUFFIXES = new Set([
+  'BLVD', 'BL', 'BOULEVARD',
+  'AVE', 'AV', 'AVENUE',
+  'ST', 'STREET',
+  'DR', 'DRIVE',
+  'RD', 'ROAD',
+  'PL', 'PLACE',
+  'WAY', 'WY',
+  'CT', 'COURT',
+  'LN', 'LANE',
+  'CIR', 'CIRCLE',
+  'PKWY', 'PARKWAY',
+  'HWY', 'HIGHWAY',
+  'TER', 'TERRACE',
+  'TRL', 'TRAIL',
+  'SQ', 'SQUARE',
+  'ALY', 'ALLEY',
+  'FWY', 'FREEWAY',
+]);
+
+const DIRECTIONALS = new Set(['N', 'S', 'E', 'W', 'NE', 'NW', 'SE', 'SW']);
+
 export async function lookupAddress(address) {
   const location = await geocode(address);
-  const routes = await findNearbyRoutes(location.lat, location.lng);
+  const streetName = extractStreetName(location.matchedAddress);
 
-  const parsed = routes
-    .map(parseRow)
-    .filter((r) => r.dayAbbr && r.startTime && r.endTime);
+  if (!streetName) {
+    return {
+      input: address,
+      matchedAddress: location.matchedAddress,
+      coordinates: { lat: location.lat, lng: location.lng },
+      schedules: [],
+      streetName: null,
+      source: 'data.lacity.org krk7-ayq2 (Posted Street Sweeping Routes)',
+      note: "Couldn't extract a street name from the matched address.",
+    };
+  }
+
+  const routes = await findRoutesByStreetName(streetName);
+
+  const parsed = routes.map(parseRow).filter((r) => r.startTime && r.endTime);
 
   const enriched = parsed.map((r) => {
-    const dayIndex = DAY_ABBR_TO_INDEX[r.dayAbbr.toUpperCase()];
+    const dayIndex =
+      r.dayAbbr && DAY_ABBR_TO_INDEX[r.dayAbbr.toUpperCase()] != null
+        ? DAY_ABBR_TO_INDEX[r.dayAbbr.toUpperCase()]
+        : null;
+
     if (dayIndex == null) {
+      // Dataset doesn't currently expose day-of-week, so we can't compute a
+      // next occurrence or a calendar link. The UI shows the route/time and
+      // tells the user to confirm with the posted sign.
       return { ...r, dayIndex: null, nextSweep: null, gcalUrl: null };
     }
+
     const next = nextOccurrence(dayIndex, r.startTime, r.endTime);
     const gcalUrl = buildGcalUrl({
       address: location.matchedAddress,
@@ -95,7 +99,8 @@ export async function lookupAddress(address) {
     return { ...r, dayIndex, nextSweep: next, gcalUrl };
   });
 
-  // De-duplicate identical route+day+time rows and sort by soonest sweep.
+  // De-duplicate identical route+day+time rows and sort by soonest sweep
+  // (rows without a known day sink to the bottom).
   const uniqMap = new Map();
   for (const row of enriched) {
     const key = `${row.routeNo}|${row.dayAbbr}|${row.startTime}|${row.endTime}`;
@@ -111,8 +116,10 @@ export async function lookupAddress(address) {
     input: address,
     matchedAddress: location.matchedAddress,
     coordinates: { lat: location.lat, lng: location.lng },
+    streetName,
     schedules,
     source: 'data.lacity.org krk7-ayq2 (Posted Street Sweeping Routes)',
+    matchMode: 'street-name-text-match',
   };
 }
 
@@ -142,38 +149,79 @@ async function geocode(address) {
 }
 
 /**
- * Query the LA Socrata dataset for route segments near a point.
- * We expand the search radius progressively until we hit something or give up.
+ * Reduce a matched address like "1234 N SUNSET BLVD, LOS ANGELES, CA, 90026"
+ * to its core street name "SUNSET", which is what we'll search for in the
+ * `boundaries` field. Returns null if we can't find anything.
+ *
+ * We keep only the "core" name token(s), dropping the house number, any
+ * leading directional (N/S/E/W), and the trailing suffix (BLVD/AVE/etc.).
+ * Streets with multi-word names like "LAUREL CYN BL" keep "LAUREL CYN",
+ * which is how the LA dataset abbreviates them in boundary descriptions.
  */
-async function findNearbyRoutes(lat, lng) {
-  const geomCol = await getGeometryColumn();
-  const radii = [25, 50, 100, 200];
-  let loggedKeys = false;
-  for (const radius of radii) {
-    const where = `within_circle(${geomCol}, ${lat}, ${lng}, ${radius})`;
-    const url = `${SOCRATA_URL}?$where=${encodeURIComponent(where)}&$limit=25`;
-    const res = await fetch(url);
-    if (!res.ok) {
-      const body = await res.text().catch(() => '');
-      throw new Error(
-        `LA data portal returned ${res.status}: ${body.slice(0, 300)}`
-      );
-    }
-    const rows = await res.json();
-    if (Array.isArray(rows) && rows.length > 0) {
-      if (!loggedKeys) {
-        console.log('[sweeping] row keys:', Object.keys(rows[0]));
-        loggedKeys = true;
-      }
-      return rows;
+export function extractStreetName(matchedAddress) {
+  if (!matchedAddress) return null;
+  const firstPart = String(matchedAddress).split(',')[0] || '';
+
+  // Tokenize; strip the leading house number if present.
+  let tokens = firstPart.trim().toUpperCase().split(/\s+/).filter(Boolean);
+  if (tokens.length && /^\d[-\dA-Z]*$/.test(tokens[0])) {
+    tokens = tokens.slice(1);
+  }
+  // Optional leading directional.
+  if (tokens.length && DIRECTIONALS.has(tokens[0])) {
+    tokens = tokens.slice(1);
+  }
+  // Strip trailing suffix (allow a trailing directional too, e.g. "1ST ST W").
+  if (tokens.length > 1 && DIRECTIONALS.has(tokens[tokens.length - 1])) {
+    tokens = tokens.slice(0, -1);
+  }
+  if (tokens.length > 1) {
+    const last = tokens[tokens.length - 1].replace(/\.$/, '');
+    if (STREET_SUFFIXES.has(last)) {
+      tokens = tokens.slice(0, -1);
     }
   }
-  return [];
+
+  const core = tokens.join(' ').trim();
+  return core || null;
+}
+
+/**
+ * Query Socrata for routes whose `boundaries` field contains the street name.
+ *
+ * We use SoQL `like` with wildcards to substring-match against the uppercased
+ * boundary text. Example:
+ *   $where=upper(boundaries) like '%SUNSET%'
+ */
+async function findRoutesByStreetName(streetName) {
+  const needle = streetName.toUpperCase().replace(/[%_']/g, ' ').trim();
+  if (!needle) return [];
+
+  const where = `upper(boundaries) like '%${needle}%'`;
+  const url = `${SOCRATA_URL}?$where=${encodeURIComponent(where)}&$limit=50`;
+  const res = await fetch(url);
+  if (!res.ok) {
+    const body = await res.text().catch(() => '');
+    throw new Error(
+      `LA data portal returned ${res.status}: ${body.slice(0, 300)}`
+    );
+  }
+  const rows = await res.json();
+  if (!Array.isArray(rows)) return [];
+  if (rows.length > 0) {
+    console.log(
+      `[sweeping] matched ${rows.length} routes for "${needle}". Sample keys:`,
+      Object.keys(rows[0])
+    );
+  }
+  return rows;
 }
 
 /**
  * Normalize a Socrata row into a stable shape. Field names on LA datasets have
- * shifted over the years, so we check a handful of likely column names.
+ * shifted over the years, so we check a handful of likely column names for
+ * each logical field. Day-of-week may be absent entirely; that's handled in
+ * the caller.
  */
 function parseRow(row) {
   const pick = (...names) => {
@@ -183,10 +231,12 @@ function parseRow(row) {
     return '';
   };
   return {
-    routeNo: String(pick('route_no', 'route', 'route_number', 'routeno')).trim(),
+    routeNo: String(pick('route_no', 'route', 'route_number', 'routeno'))
+      .replace(/^\*\s*/, '') // some rows prefix with "* " for special routes
+      .trim(),
     dayAbbr: String(pick('weekday', 'day_of_week', 'day', 'dow')).trim(),
-    startTime: String(pick('start_time', 'starttime', 'time_start', 'start')).trim(),
-    endTime: String(pick('end_time', 'endtime', 'time_end', 'end')).trim(),
+    startTime: String(pick('time_start', 'start_time', 'starttime', 'start')).trim(),
+    endTime: String(pick('time_end', 'end_time', 'endtime', 'end')).trim(),
     boundaries: String(pick('boundaries', 'description', 'location_description')).trim(),
     councilDistrict: String(pick('cd', 'council_district', 'councildistrict')).trim(),
   };
