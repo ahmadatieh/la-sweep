@@ -3,7 +3,7 @@
 A tiny web app: type an LA address, see the posted street-sweeping schedule
 for that block, and add the next sweep to your Google Calendar in one click.
 
-- **Data**: [LA Open Data – Posted Street Sweeping Routes (`krk7-ayq2`)](https://data.lacity.org/City-Infrastructure-Service-Requests/Posted-Street-Sweeping-Routes/krk7-ayq2), queried spatially so we return route segments near the address.
+- **Data**: LA's [Posted Street Sweeping Routes ArcGIS layer](https://www.arcgis.com/home/item.html?id=0e16fa641a0846a3ae29bffb150314dc) (`Posted_Street_Sweeping_Routes_Update/FeatureServer/0`), queried with a true point-in-polygon intersect so we return only the route(s) the address actually sits inside.
 - **Geocoding**: US Census Bureau's free geocoder (no API key needed).
 - **Calendar**: A prefilled `calendar.google.com` link — user clicks, reviews, saves. No OAuth.
 
@@ -13,7 +13,7 @@ for that block, and add the next sweep to your Google Calendar in one click.
 la-sweep/
 ├── server/          Express API (Node 18+)
 │   ├── index.js        HTTP routes + CORS
-│   ├── sweeping.js     geocode + Socrata spatial query
+│   ├── sweeping.js     geocode + ArcGIS point-in-polygon query
 │   └── schedule.js     next-occurrence + gcal URL builder
 ├── client/          Vite + React frontend (standalone web app)
 │   └── src/
@@ -73,28 +73,23 @@ button per schedule.
 
 ## Caveats / things to improve
 
-- **Match mode is text-based, not spatial.** LA stripped the geometry column
-  from the `krk7-ayq2` Socrata dataset, so we can no longer do a true
-  point-in-polygon query. Current logic: geocode → extract street name →
-  find routes whose `boundaries` description mentions that street. Routes
-  bounded by your street will match; a user on a side-street inside a route
-  polygon whose bounds don't mention their street **will not match**. Confirm
-  with the posted sign.
-- **Day-of-week may be missing.** The current Socrata schema exposes only
-  `route_no, cd, time_start, time_end, boundaries` — no weekday column. When
-  a match has no day we still show route + times, but the calendar button is
-  disabled for that row. If you find a dataset that carries day info, wire it
-  into `parseRow` (it already probes `weekday`, `day_of_week`, `day`, `dow`).
+- **Match is a true point-in-polygon.** We hand the geocoded lat/lng to the
+  ArcGIS layer with `spatialRel=esriSpatialRelIntersects`, so we only return
+  the route(s) the address actually falls inside. If the geocoder puts the
+  point slightly off the right side of the street you may miss a route — try
+  a more precise address (with unit, or move across the street).
 - Only the **next occurrence** is added to the calendar (per your
   preference). If you want a weekly recurring event, add
   `&recur=RRULE:FREQ=WEEKLY;BYDAY=WE` to the URL in `buildGcalUrl`.
-- The LA dataset is mostly **weekly** schedules, but some posted routes are
-  biweekly (1st/3rd or 2nd/4th weeks). If your street shows "Biweekly" on the
-  posted sign, confirm the week before relying on the reminder.
+- The LA dataset is mostly **weekly** schedules, but some routes carry a
+  `Weeks` or `Odd_Even` flag for biweekly cadence (1st/3rd, 2nd/4th). The
+  backend surfaces both fields on each schedule; if your street shows
+  "Biweekly" on the posted sign, confirm the week before relying on the
+  reminder.
 - The Census Geocoder is US-only and has a query rate limit. For production
   use, swap in Google/Mapbox geocoding.
-- No caching. For anything more than personal use, cache the LA dataset
-  nightly rather than hitting the Socrata endpoint on every request.
+- No caching. For anything more than personal use, cache the ArcGIS layer
+  nightly rather than hitting the FeatureServer on every request.
 
 ## Deploy the backend
 

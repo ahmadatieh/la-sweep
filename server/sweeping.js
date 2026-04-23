@@ -2,124 +2,88 @@ import { nextOccurrence, buildGcalUrl } from './schedule.js';
 
 const GEOCODER_URL =
   'https://geocoding.geo.census.gov/geocoder/locations/onelineaddress';
-const SOCRATA_URL = 'https://data.lacity.org/resource/krk7-ayq2.json';
 
 /**
- * The LA open-data Socrata dataset `krk7-ayq2` ("Posted Street Sweeping
- * Routes") no longer carries a geometry column. We used to do a spatial
- * `within_circle()` query; that endpoint now 400s with "No such column: the_geom".
+ * LA's authoritative Posted Street Sweeping Routes layer, hosted on ArcGIS
+ * Online. Has polygon geometry for every route, so we can do a real
+ * point-in-polygon query and return only the route(s) that actually contain
+ * the user's address.
  *
- * Fallback strategy: geocode the address, extract the street name, and ask
- * Socrata for rows whose `boundaries` description mentions that street. This
- * returns the routes whose polygon boundary *touches* the user's street.
- * Imperfect (a user on a side-street inside a polygon won't match) but it's
- * the best we can do without geometry. The UI disclaims this.
+ * Item: https://www.arcgis.com/home/item.html?id=0e16fa641a0846a3ae29bffb150314dc
+ * Fields: Route, Posted_Day, Day_Short, Posted_Time, Boundaries, Weeks,
+ *         Odd_Even, Maint_District, MD_Name, Maint_Area, ...
  */
+const ARCGIS_QUERY_URL =
+  'https://services1.arcgis.com/PTh9WC0Sf2WS7AAq/ArcGIS/rest/services/' +
+  'Posted_Street_Sweeping_Routes_Update/FeatureServer/0/query';
 
-/**
- * Map of common day-abbreviation variants used in the LA dataset to a
- * weekday index compatible with JavaScript's Date#getDay:
- *   0 = Sunday, 1 = Monday, ... 6 = Saturday.
- */
-const DAY_ABBR_TO_INDEX = {
-  SUN: 0, SU: 0,
-  MON: 1, M: 1,
-  TUE: 2, TU: 2, TUES: 2,
-  WED: 3, W: 3, WE: 3,
-  THU: 4, TH: 4, THUR: 4, THURS: 4,
-  FRI: 5, F: 5, FR: 5,
-  SAT: 6, SA: 6,
+// Map "Friday"/"Mon"/"TU" etc. to JS weekday index (0=Sun..6=Sat).
+const DAY_TO_INDEX = {
+  SUNDAY: 0, SUN: 0, SU: 0,
+  MONDAY: 1, MON: 1, M: 1,
+  TUESDAY: 2, TUES: 2, TUE: 2, TU: 2, T: 2,
+  WEDNESDAY: 3, WED: 3, WE: 3, W: 3,
+  THURSDAY: 4, THURS: 4, THUR: 4, THU: 4, TH: 4,
+  FRIDAY: 5, FRI: 5, FR: 5, F: 5,
+  SATURDAY: 6, SAT: 6, SA: 6,
 };
-
-// Common street-type suffixes we'll strip when reducing an address to its
-// "core" street name. Kept broad so we match what the Census geocoder returns.
-const STREET_SUFFIXES = new Set([
-  'BLVD', 'BL', 'BOULEVARD',
-  'AVE', 'AV', 'AVENUE',
-  'ST', 'STREET',
-  'DR', 'DRIVE',
-  'RD', 'ROAD',
-  'PL', 'PLACE',
-  'WAY', 'WY',
-  'CT', 'COURT',
-  'LN', 'LANE',
-  'CIR', 'CIRCLE',
-  'PKWY', 'PARKWAY',
-  'HWY', 'HIGHWAY',
-  'TER', 'TERRACE',
-  'TRL', 'TRAIL',
-  'SQ', 'SQUARE',
-  'ALY', 'ALLEY',
-  'FWY', 'FREEWAY',
-]);
-
-const DIRECTIONALS = new Set(['N', 'S', 'E', 'W', 'NE', 'NW', 'SE', 'SW']);
 
 export async function lookupAddress(address) {
   const location = await geocode(address);
-  const streetName = extractStreetName(location.matchedAddress);
+  const features = await findRoutesAtPoint(location.lat, location.lng);
 
-  if (!streetName) {
-    return {
-      input: address,
-      matchedAddress: location.matchedAddress,
-      coordinates: { lat: location.lat, lng: location.lng },
-      schedules: [],
-      streetName: null,
-      source: 'data.lacity.org krk7-ayq2 (Posted Street Sweeping Routes)',
-      note: "Couldn't extract a street name from the matched address.",
-    };
-  }
-
-  const routes = await findRoutesByStreetName(streetName);
-
-  const parsed = routes.map(parseRow).filter((r) => r.startTime && r.endTime);
-
-  const enriched = parsed.map((r) => {
-    const dayIndex =
-      r.dayAbbr && DAY_ABBR_TO_INDEX[r.dayAbbr.toUpperCase()] != null
-        ? DAY_ABBR_TO_INDEX[r.dayAbbr.toUpperCase()]
-        : null;
-
-    if (dayIndex == null) {
-      // Dataset doesn't currently expose day-of-week, so we can't compute a
-      // next occurrence or a calendar link. The UI shows the route/time and
-      // tells the user to confirm with the posted sign.
-      return { ...r, dayIndex: null, nextSweep: null, gcalUrl: null };
+  // Each ArcGIS feature can describe a route that runs on one day ("Friday")
+  // or multiple ("Monday to Friday"). Expand each feature into one schedule
+  // per day so the UI can show a clean list with a calendar button per day.
+  const schedules = [];
+  for (const f of features) {
+    const parsed = parseFeature(f);
+    if (!parsed) continue;
+    for (const dayIndex of parsed.dayIndexes) {
+      const next = nextOccurrence(
+        dayIndex,
+        parsed.startTime,
+        parsed.endTime
+      );
+      const gcalUrl = buildGcalUrl({
+        address: location.matchedAddress,
+        routeNo: parsed.routeNo,
+        boundaries: parsed.boundaries,
+        start: next.start,
+        end: next.end,
+      });
+      schedules.push({
+        routeNo: parsed.routeNo,
+        dayIndex,
+        dayAbbr: abbrFor(dayIndex),
+        dayName: nameFor(dayIndex),
+        startTime: parsed.startTime,
+        endTime: parsed.endTime,
+        boundaries: parsed.boundaries,
+        weeks: parsed.weeks,
+        oddEven: parsed.oddEven,
+        maintDistrict: parsed.maintDistrict,
+        // Preserve the old response field name so the existing Framer
+        // component's "CD" pill keeps rendering without changes.
+        councilDistrict: parsed.maintDistrict || '',
+        nextSweep: next,
+        gcalUrl,
+      });
     }
-
-    const next = nextOccurrence(dayIndex, r.startTime, r.endTime);
-    const gcalUrl = buildGcalUrl({
-      address: location.matchedAddress,
-      routeNo: r.routeNo,
-      boundaries: r.boundaries,
-      start: next.start,
-      end: next.end,
-    });
-    return { ...r, dayIndex, nextSweep: next, gcalUrl };
-  });
-
-  // De-duplicate identical route+day+time rows and sort by soonest sweep
-  // (rows without a known day sink to the bottom).
-  const uniqMap = new Map();
-  for (const row of enriched) {
-    const key = `${row.routeNo}|${row.dayAbbr}|${row.startTime}|${row.endTime}`;
-    if (!uniqMap.has(key)) uniqMap.set(key, row);
   }
-  const schedules = [...uniqMap.values()].sort((a, b) => {
-    const ta = a.nextSweep ? Date.parse(a.nextSweep.start) : Infinity;
-    const tb = b.nextSweep ? Date.parse(b.nextSweep.start) : Infinity;
-    return ta - tb;
-  });
+
+  // Sort by soonest sweep.
+  schedules.sort((a, b) => Date.parse(a.nextSweep.start) - Date.parse(b.nextSweep.start));
 
   return {
     input: address,
     matchedAddress: location.matchedAddress,
     coordinates: { lat: location.lat, lng: location.lng },
-    streetName,
     schedules,
-    source: 'data.lacity.org krk7-ayq2 (Posted Street Sweeping Routes)',
-    matchMode: 'street-name-text-match',
+    source:
+      'ArcGIS — Posted_Street_Sweeping_Routes_Update/FeatureServer/0 ' +
+      '(point-in-polygon)',
+    matchMode: 'spatial-intersects',
   };
 }
 
@@ -149,120 +113,146 @@ async function geocode(address) {
 }
 
 /**
- * Reduce a matched address like "1234 N SUNSET BLVD, LOS ANGELES, CA, 90026"
- * to its core street name "SUNSET", which is what we'll search for in the
- * `boundaries` field. Returns null if we can't find anything.
- *
- * We keep only the "core" name token(s), dropping the house number, any
- * leading directional (N/S/E/W), and the trailing suffix (BLVD/AVE/etc.).
- * Streets with multi-word names like "LAUREL CYN BL" keep "LAUREL CYN",
- * which is how the LA dataset abbreviates them in boundary descriptions.
+ * Ask the ArcGIS layer for the route polygon(s) that contain (lat, lng).
+ * Returns an array of feature objects ({ attributes: { ... } }).
  */
-export function extractStreetName(matchedAddress) {
-  if (!matchedAddress) return null;
-  const firstPart = String(matchedAddress).split(',')[0] || '';
+async function findRoutesAtPoint(lat, lng) {
+  const params = new URLSearchParams({
+    f: 'json',
+    where: '1=1',
+    geometry: JSON.stringify({ x: lng, y: lat }),
+    geometryType: 'esriGeometryPoint',
+    inSR: '4326',
+    outSR: '4326',
+    spatialRel: 'esriSpatialRelIntersects',
+    outFields: '*',
+    returnGeometry: 'false',
+  });
 
-  // Tokenize; strip the leading house number if present.
-  let tokens = firstPart.trim().toUpperCase().split(/\s+/).filter(Boolean);
-  if (tokens.length && /^\d[-\dA-Z]*$/.test(tokens[0])) {
-    tokens = tokens.slice(1);
-  }
-  // Optional leading directional.
-  if (tokens.length && DIRECTIONALS.has(tokens[0])) {
-    tokens = tokens.slice(1);
-  }
-  // Strip trailing suffix (allow a trailing directional too, e.g. "1ST ST W").
-  if (tokens.length > 1 && DIRECTIONALS.has(tokens[tokens.length - 1])) {
-    tokens = tokens.slice(0, -1);
-  }
-  if (tokens.length > 1) {
-    const last = tokens[tokens.length - 1].replace(/\.$/, '');
-    if (STREET_SUFFIXES.has(last)) {
-      tokens = tokens.slice(0, -1);
-    }
-  }
-
-  const core = tokens.join(' ').trim();
-  return core || null;
-}
-
-/**
- * Query Socrata for routes whose `boundaries` field contains the street name.
- *
- * We use SoQL `like` with wildcards to substring-match against the uppercased
- * boundary text. Example:
- *   $where=upper(boundaries) like '%SUNSET%'
- */
-async function findRoutesByStreetName(streetName) {
-  const needle = streetName.toUpperCase().replace(/[%_']/g, ' ').trim();
-  if (!needle) return [];
-
-  const where = `upper(boundaries) like '%${needle}%'`;
-  const url = `${SOCRATA_URL}?$where=${encodeURIComponent(where)}&$limit=50`;
+  const url = `${ARCGIS_QUERY_URL}?${params.toString()}`;
   const res = await fetch(url);
   if (!res.ok) {
     const body = await res.text().catch(() => '');
     throw new Error(
-      `LA data portal returned ${res.status}: ${body.slice(0, 300)}`
+      `ArcGIS layer returned ${res.status}: ${body.slice(0, 300)}`
     );
   }
-  const rows = await res.json();
-  if (!Array.isArray(rows)) return [];
-  if (rows.length > 0) {
+  const data = await res.json();
+  if (data?.error) {
+    throw new Error(`ArcGIS error: ${data.error.message || 'unknown'}`);
+  }
+  const features = Array.isArray(data?.features) ? data.features : [];
+  if (features.length > 0) {
     console.log(
-      `[sweeping] matched ${rows.length} routes for "${needle}". Sample keys:`,
-      Object.keys(rows[0])
+      `[sweeping] ${features.length} route polygon(s) at (${lat.toFixed(4)}, ${lng.toFixed(4)})`
     );
   }
-  return rows;
+  return features;
 }
 
-// Recognized day suffixes appearing at the end of route_no strings, ordered
-// longest-first so the regex prefers multi-char matches (e.g. "Tu" over "T").
-const ROUTE_DAY_SUFFIX_RE = new RegExp(
-  String.raw`^(.*?)\s+(SUN|MON|TUES|TUE|THURS|THUR|THU|WED|FRI|SAT|SU|TU|TH|WE|FR|SA|M|W|F)\.?$`,
-  'i'
-);
+/**
+ * Take a raw ArcGIS feature and pull out the fields we need. Returns null if
+ * something critical is missing (day or time).
+ *
+ * Notes:
+ * - `Posted_Day` is human-readable ("Friday", "Monday to Friday"); `Day_Short`
+ *   is abbreviated ("F", "M") and is the more reliable source when present.
+ * - `Posted_Time` looks like "8:00 AM - 10:00 AM" — we split on the dash.
+ */
+function parseFeature(feature) {
+  const a = feature?.attributes || {};
+  const timeRaw = String(a.Posted_Time || '').trim();
+  if (!timeRaw) return null;
+
+  const [startRaw, endRaw] = splitTimeRange(timeRaw);
+  if (!startRaw || !endRaw) return null;
+
+  const dayIndexes = resolveDayIndexes(a.Day_Short, a.Posted_Day);
+  if (dayIndexes.length === 0) return null;
+
+  return {
+    routeNo: String(a.Route || '').trim(),
+    boundaries: String(a.Boundaries || '').trim(),
+    weeks: String(a.Weeks || '').trim() || null,
+    oddEven: String(a.Odd_Even || '').trim() || null,
+    maintDistrict: String(a.Maint_District || '').trim() || null,
+    startTime: startRaw,
+    endTime: endRaw,
+    dayIndexes,
+  };
+}
 
 /**
- * Normalize a Socrata row into a stable shape. Field names on LA datasets have
- * shifted over the years, so we check a handful of likely column names for
- * each logical field.
- *
- * Day-of-week: LA's current `krk7-ayq2` schema doesn't expose a weekday
- * column, but encodes the day as a whitespace-separated suffix on the route
- * number itself (e.g. "8P205 M", "13P282 Th", "7P326 W"). We strip the
- * suffix off the route number and lift it into `dayAbbr`.
+ * Split strings like "8:00 AM - 10:00 AM" or "10:00 AM–12:00 PM" (note the
+ * en-dash variant) into ["8:00 AM", "10:00 AM"]. Forgiving of extra spaces.
  */
-function parseRow(row) {
-  const pick = (...names) => {
-    for (const n of names) {
-      if (row[n] != null && row[n] !== '') return row[n];
-    }
-    return '';
-  };
+function splitTimeRange(raw) {
+  const parts = String(raw).split(/\s*[-–—]\s*/);
+  if (parts.length < 2) return [null, null];
+  return [parts[0].trim(), parts.slice(1).join('-').trim()];
+}
 
-  let routeNo = String(pick('route_no', 'route', 'route_number', 'routeno'))
-    .replace(/^\*\s*/, '') // some rows prefix with "* " for special routes
-    .trim();
+/**
+ * Resolve day-of-week into an array of weekday indexes. Handles:
+ *   Day_Short = "F"           → [5]
+ *   Day_Short = "M", "Tu"     → [1], [2]
+ *   Posted_Day = "Friday"     → [5]
+ *   Posted_Day = "Monday to Friday" → [1, 2, 3, 4, 5]
+ *   Posted_Day = "Mon, Wed"   → [1, 3]
+ * Returns [] if we can't recognize anything.
+ */
+function resolveDayIndexes(dayShort, postedDay) {
+  const short = String(dayShort || '').trim().toUpperCase();
+  if (short && DAY_TO_INDEX[short] != null) {
+    return [DAY_TO_INDEX[short]];
+  }
 
-  let dayAbbr = String(pick('weekday', 'day_of_week', 'day', 'dow')).trim();
+  const full = String(postedDay || '').trim();
+  if (!full) return [];
 
-  // If no explicit day column, try the suffix on route_no.
-  if (!dayAbbr) {
-    const m = routeNo.match(ROUTE_DAY_SUFFIX_RE);
-    if (m) {
-      routeNo = m[1].trim();
-      dayAbbr = m[2];
+  // Range like "Monday to Friday" or "Monday - Wednesday".
+  const rangeMatch = full.match(
+    /^\s*([A-Za-z]+)\s+(?:to|through|-|–)\s+([A-Za-z]+)\s*$/i
+  );
+  if (rangeMatch) {
+    const from = DAY_TO_INDEX[rangeMatch[1].toUpperCase()];
+    const to = DAY_TO_INDEX[rangeMatch[2].toUpperCase()];
+    if (from != null && to != null) {
+      const out = [];
+      // Walk forward through the week; handles wraparound if anyone ever
+      // puts "Friday to Monday", though that's unlikely in this dataset.
+      let i = from;
+      for (let guard = 0; guard < 7; guard++) {
+        out.push(i);
+        if (i === to) break;
+        i = (i + 1) % 7;
+      }
+      return out;
     }
   }
 
-  return {
-    routeNo,
-    dayAbbr,
-    startTime: String(pick('time_start', 'start_time', 'starttime', 'start')).trim(),
-    endTime: String(pick('time_end', 'end_time', 'endtime', 'end')).trim(),
-    boundaries: String(pick('boundaries', 'description', 'location_description')).trim(),
-    councilDistrict: String(pick('cd', 'council_district', 'councildistrict')).trim(),
-  };
+  // Comma/slash/ampersand-separated list like "Mon, Wed & Fri".
+  const parts = full.split(/[,/&]|\band\b/i).map((s) => s.trim()).filter(Boolean);
+  const indexes = parts
+    .map((p) => DAY_TO_INDEX[p.toUpperCase()])
+    .filter((v) => v != null);
+  if (indexes.length > 0) return [...new Set(indexes)];
+
+  // Single day.
+  if (DAY_TO_INDEX[full.toUpperCase()] != null) {
+    return [DAY_TO_INDEX[full.toUpperCase()]];
+  }
+
+  return [];
+}
+
+function abbrFor(idx) {
+  return ['Su', 'M', 'Tu', 'W', 'Th', 'F', 'Sa'][idx] || '';
+}
+
+function nameFor(idx) {
+  return [
+    'Sunday', 'Monday', 'Tuesday', 'Wednesday',
+    'Thursday', 'Friday', 'Saturday',
+  ][idx] || '';
 }
