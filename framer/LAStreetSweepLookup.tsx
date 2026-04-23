@@ -45,9 +45,22 @@ type Schedule = {
     startTime: string
     endTime: string
     boundaries: string
-    councilDistrict: string
+    weeks: string | null
+    oddEven: string | null
     nextSweep: { start: string; end: string } | null
     gcalUrl: string | null
+}
+
+/**
+ * LA posts some routes as biweekly ("weeks 1 & 3" or "weeks 2 & 4"). When
+ * `weeks` is populated on a schedule it means this route does NOT run every
+ * week — worth surfacing clearly so someone doesn't move their car on an
+ * off-week for no reason.
+ */
+function cadenceLabel(s: Schedule) {
+    if (s.weeks) return `Biweekly · Wks ${s.weeks}`
+    if (s.oddEven) return `Biweekly · ${s.oddEven} weeks`
+    return null
 }
 
 type LookupResult = {
@@ -294,7 +307,9 @@ export default function LAStreetSweepLookup(props: Props) {
                                     <div
                                         style={{
                                             display: "flex",
-                                            gap: 16,
+                                            alignItems: "center",
+                                            flexWrap: "wrap",
+                                            gap: 8,
                                             fontSize: 14,
                                             marginBottom: 8,
                                         }}
@@ -305,13 +320,20 @@ export default function LAStreetSweepLookup(props: Props) {
                                             </span>
                                             {s.routeNo || "—"}
                                         </div>
-                                        {s.councilDistrict && (
-                                            <div>
-                                                <span style={labelStyle}>
-                                                    CD
-                                                </span>
-                                                {s.councilDistrict}
-                                            </div>
+                                        {cadenceLabel(s) && (
+                                            <span
+                                                style={{
+                                                    padding: "3px 8px",
+                                                    borderRadius: 999,
+                                                    background: accentColor,
+                                                    color: "#fff",
+                                                    fontSize: 11,
+                                                    fontWeight: 600,
+                                                    letterSpacing: "0.02em",
+                                                }}
+                                            >
+                                                {cadenceLabel(s)}
+                                            </span>
                                         )}
                                     </div>
                                     {s.boundaries && (

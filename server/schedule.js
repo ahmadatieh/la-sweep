@@ -181,18 +181,77 @@ function toGcalStamp(date) {
   );
 }
 
+// iCalendar BYDAY codes indexed by Date#getDay convention (0=Sun..6=Sat).
+const RRULE_DAY = ['SU', 'MO', 'TU', 'WE', 'TH', 'FR', 'SA'];
+
+/**
+ * Build an iCal RRULE for the sweep schedule, based on day-of-week and the
+ * route's "weeks" flag from the LA dataset.
+ *
+ *   weekly route       → FREQ=WEEKLY;BYDAY=WE
+ *   "weeks 1 & 3" Wed  → FREQ=MONTHLY;BYDAY=1WE,3WE
+ *   "weeks 2 & 4" Mon  → FREQ=MONTHLY;BYDAY=2MO,4MO
+ *
+ * Returns null if we can't produce a sane rule (e.g. unknown day).
+ */
+function buildRRule(dayIndex, weeks) {
+  const code = RRULE_DAY[dayIndex];
+  if (!code) return null;
+
+  if (weeks) {
+    // Pull any digits out — accepts "1 & 3", "2, 4", "1 and 3", etc.
+    const nums = String(weeks).match(/\d+/g) || [];
+    const valid = nums.map(Number).filter((n) => n >= 1 && n <= 5);
+    if (valid.length > 0) {
+      const byDay = valid.map((n) => `${n}${code}`).join(',');
+      return `RRULE:FREQ=MONTHLY;BYDAY=${byDay}`;
+    }
+  }
+  return `RRULE:FREQ=WEEKLY;BYDAY=${code}`;
+}
+
+/**
+ * Human-readable cadence string for the event description. Matches the
+ * RRULE so the two tell the same story.
+ */
+function cadenceDescription(dayIndex, weeks) {
+  const dayName =
+    ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'][dayIndex] || '';
+  if (weeks) {
+    const nums = String(weeks).match(/\d+/g) || [];
+    if (nums.length > 0) {
+      const ordinal = (n) =>
+        ({ 1: '1st', 2: '2nd', 3: '3rd', 4: '4th', 5: '5th' }[n] || `${n}`);
+      const parts = nums.map(ordinal).join(' & ');
+      return `Repeats: ${parts} ${dayName} of each month`;
+    }
+  }
+  return dayName ? `Repeats: Every ${dayName}` : null;
+}
+
 /**
  * Build a Google Calendar "create event" URL. Users click it and confirm;
- * no OAuth required.
+ * no OAuth required. Includes an RRULE so the event recurs on the actual
+ * sweep schedule (weekly or biweekly) rather than being a one-off.
  */
-export function buildGcalUrl({ address, routeNo, boundaries, start, end }) {
+export function buildGcalUrl({
+  address,
+  routeNo,
+  boundaries,
+  start,
+  end,
+  dayIndex,
+  weeks,
+}) {
   const dates = `${toGcalStamp(start)}/${toGcalStamp(end)}`;
+  const cadence = dayIndex != null ? cadenceDescription(dayIndex, weeks) : null;
   const detailsLines = [
     'Do not park here during this window.',
     '',
     `Address: ${address || ''}`,
     routeNo ? `Route: ${routeNo}` : null,
     boundaries ? `Area: ${boundaries}` : null,
+    cadence,
   ].filter(Boolean);
 
   const params = new URLSearchParams({
@@ -203,5 +262,9 @@ export function buildGcalUrl({ address, routeNo, boundaries, start, end }) {
     location: address || '',
     ctz: LA_TZ,
   });
+
+  const rrule = dayIndex != null ? buildRRule(dayIndex, weeks) : null;
+  if (rrule) params.append('recur', rrule);
+
   return `https://calendar.google.com/calendar/render?${params.toString()}`;
 }

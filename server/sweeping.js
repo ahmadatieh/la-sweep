@@ -51,6 +51,8 @@ export async function lookupAddress(address) {
         boundaries: parsed.boundaries,
         start: next.start,
         end: next.end,
+        dayIndex,
+        weeks: parsed.weeks,
       });
       schedules.push({
         routeNo: parsed.routeNo,
